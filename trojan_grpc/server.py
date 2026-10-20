@@ -11,7 +11,9 @@ import asyncio
 import contextlib
 import hmac
 import logging
+import socket
 import ssl
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -23,10 +25,13 @@ import h2.settings
 from .protocol import (
     MAX_TROJAN_HEADER,
     ProtocolError,
+    UdpPacket,
+    encode_udp_packet,
     encode_grpc_message,
     parse_trojan_request,
     password_to_hex,
     pop_grpc_messages,
+    pop_udp_packets,
 )
 
 LOG = logging.getLogger("trojan_grpc")
@@ -40,6 +45,26 @@ class ServerOptions:
     max_message_size: int = 16 * 1024
     max_pending_input: int = 256 * 1024
     connect_timeout: float = 10.0
+    enable_udp: bool = True
+    udp_idle_timeout: float = 60.0
+    # Leave room for an IPv6 Trojan UDP packet header in one Hunk message.
+    max_udp_payload: int = 16 * 1024 - 22
+
+
+class UdpReceiver(asyncio.DatagramProtocol):
+    """Places datagrams from one association socket into a bounded queue."""
+
+    def __init__(self, queue: "asyncio.Queue[tuple[bytes, tuple]]") -> None:
+        self.queue = queue
+
+    def datagram_received(self, data: bytes, address: tuple) -> None:
+        try:
+            self.queue.put_nowait((data, address))
+        except asyncio.QueueFull:
+            LOG.debug("dropping UDP response because the association queue is full")
+
+    def error_received(self, exc: Exception) -> None:
+        LOG.debug("UDP socket error: %s", exc)
 
 
 @dataclass
@@ -52,6 +77,12 @@ class Tunnel:
     worker: Optional[asyncio.Task[None]] = None
     target_reader: Optional[asyncio.StreamReader] = None
     target_writer: Optional[asyncio.StreamWriter] = None
+    command: Optional[int] = None
+    udp_buffer: bytearray = field(default_factory=bytearray)
+    udp_queue: "asyncio.Queue[tuple[bytes, tuple]]" = field(default_factory=lambda: asyncio.Queue(maxsize=64))
+    udp_transports: Dict[int, asyncio.DatagramTransport] = field(default_factory=dict)
+    udp_response_task: Optional[asyncio.Task[None]] = None
+    last_udp_activity: float = field(default_factory=time.monotonic)
     closed: bool = False
 
     def start(self) -> None:
@@ -72,16 +103,28 @@ class Tunnel:
         target_task: Optional[asyncio.Task[None]] = None
         try:
             while True:
-                payload = await self.inbound.get()
+                try:
+                    payload = (
+                        await asyncio.wait_for(self.inbound.get(), self.connection.options.udp_idle_timeout)
+                        if self.command == 3
+                        else await self.inbound.get()
+                    )
+                except asyncio.TimeoutError:
+                    if time.monotonic() - self.last_udp_activity >= self.connection.options.udp_idle_timeout:
+                        LOG.info("stream %s UDP association timed out", self.stream_id)
+                        break
+                    continue
                 if payload is None:
-                    if self.target_writer is None:
+                    if self.command is None:
                         raise ProtocolError("stream ended before complete Trojan request")
-                    self.target_writer.write_eof()
-                    await self.target_writer.drain()
+                    if self.command == 1:
+                        assert self.target_writer is not None
+                        self.target_writer.write_eof()
+                        await self.target_writer.drain()
                     break
                 self.buffered_input -= len(payload)
 
-                if self.target_writer is None:
+                if self.command is None:
                     header_buffer.extend(payload)
                     if len(header_buffer) > MAX_TROJAN_HEADER:
                         raise ProtocolError("Trojan request header exceeds 64 KiB")
@@ -91,19 +134,29 @@ class Tunnel:
                     request, _ = parsed
                     if not hmac.compare_digest(request.password, self.connection.password_hash):
                         raise AuthenticationError("incorrect Trojan password")
-                    self.target_reader, self.target_writer = await asyncio.wait_for(
-                        asyncio.open_connection(request.host, request.port),
-                        timeout=self.connection.options.connect_timeout,
-                    )
-                    LOG.info("stream %s connected to %s:%s", self.stream_id, request.host, request.port)
-                    target_task = asyncio.create_task(self._target_to_grpc())
-                    if request.payload:
-                        self.target_writer.write(request.payload)
-                        await self.target_writer.drain()
+                    self.command = request.command
+                    if request.command == 1:
+                        self.target_reader, self.target_writer = await asyncio.wait_for(
+                            asyncio.open_connection(request.host, request.port),
+                            timeout=self.connection.options.connect_timeout,
+                        )
+                        LOG.info("stream %s connected to %s:%s", self.stream_id, request.host, request.port)
+                        target_task = asyncio.create_task(self._target_to_grpc())
+                        if request.payload:
+                            self.target_writer.write(request.payload)
+                            await self.target_writer.drain()
+                    else:
+                        if not self.connection.options.enable_udp:
+                            raise ProtocolError("UDP support is disabled")
+                        await self._start_udp()
+                        await self._send_udp_packets(request.payload)
                     header_buffer.clear()
-                else:
+                elif self.command == 1:
+                    assert self.target_writer is not None
                     self.target_writer.write(payload)
                     await self.target_writer.drain()
+                else:
+                    await self._send_udp_packets(payload)
 
             if target_task is not None:
                 await target_task
@@ -131,12 +184,68 @@ class Tunnel:
                 self.target_writer.close()
                 with contextlib.suppress(OSError):
                     await self.target_writer.wait_closed()
+            if self.udp_response_task and not self.udp_response_task.done():
+                self.udp_response_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.udp_response_task
+            for transport in self.udp_transports.values():
+                transport.close()
             self.connection.tunnels.pop(self.stream_id, None)
 
     async def _target_to_grpc(self) -> None:
         assert self.target_reader is not None
         while data := await self.target_reader.read(self.connection.options.max_message_size):
             await self.connection.send_grpc_message(self.stream_id, data)
+
+    async def _start_udp(self) -> None:
+        await self._udp_transport(socket.AF_INET)
+        self.udp_response_task = asyncio.create_task(
+            self._udp_to_grpc(), name=f"trojan-udp-responses-{self.stream_id}"
+        )
+        self.last_udp_activity = time.monotonic()
+        LOG.info("stream %s started UDP association", self.stream_id)
+
+    async def _udp_transport(self, family: int) -> asyncio.DatagramTransport:
+        transport = self.udp_transports.get(family)
+        if transport is not None:
+            return transport
+        local_addr = ("0.0.0.0", 0) if family == socket.AF_INET else ("::", 0)
+        transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: UdpReceiver(self.udp_queue), local_addr=local_addr, family=family
+        )
+        self.udp_transports[family] = transport
+        return transport
+
+    async def _send_udp_packets(self, data: bytes) -> None:
+        self.udp_buffer.extend(data)
+        if len(self.udp_buffer) > self.connection.options.max_pending_input:
+            raise ProtocolError("UDP packet buffer exceeds configured limit")
+        for packet in pop_udp_packets(self.udp_buffer, self.connection.options.max_udp_payload):
+            addresses = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(
+                    packet.host, packet.port, type=socket.SOCK_DGRAM
+                ),
+                timeout=self.connection.options.connect_timeout,
+            )
+            if not addresses:
+                raise OSError("UDP target did not resolve to an address")
+            family, _, _, _, sockaddr = addresses[0]
+            transport = await self._udp_transport(family)
+            transport.sendto(packet.payload, sockaddr)
+            self.last_udp_activity = time.monotonic()
+
+    async def _udp_to_grpc(self) -> None:
+        while True:
+            data, address = await self.udp_queue.get()
+            if len(data) > self.connection.options.max_udp_payload:
+                LOG.debug("dropping oversized UDP response on stream %s", self.stream_id)
+                continue
+            packet = encode_udp_packet(UdpPacket(address[0], address[1], data))
+            if len(packet) > self.connection.options.max_message_size:
+                LOG.debug("dropping UDP response that exceeds gRPC message limit on stream %s", self.stream_id)
+                continue
+            self.last_udp_activity = time.monotonic()
+            await self.connection.send_grpc_message(self.stream_id, packet)
 
     async def close(self) -> None:
         self.closed = True
@@ -336,6 +445,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--key", help="PEM private key; requires --cert")
     parser.add_argument("--max-streams", type=int, default=128)
     parser.add_argument("--max-message-size", type=int, default=16 * 1024)
+    parser.add_argument("--disable-udp", action="store_true", help="reject Trojan UDP ASSOCIATE requests")
+    parser.add_argument("--udp-idle-timeout", type=float, default=60.0)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -343,7 +454,7 @@ def parse_args() -> argparse.Namespace:
 async def _main_async(args: argparse.Namespace) -> None:
     if bool(args.cert) != bool(args.key):
         raise SystemExit("--cert and --key must be supplied together")
-    if args.max_streams < 1 or args.max_message_size < 1:
+    if args.max_streams < 1 or args.max_message_size < 1 or args.udp_idle_timeout <= 0:
         raise SystemExit("stream and message limits must be positive")
     ssl_context = build_ssl_context(args.cert, args.key) if args.cert else None
     options = ServerOptions(
@@ -351,6 +462,9 @@ async def _main_async(args: argparse.Namespace) -> None:
         service_name=args.service_name,
         max_streams=args.max_streams,
         max_message_size=args.max_message_size,
+        enable_udp=not args.disable_udp,
+        udp_idle_timeout=args.udp_idle_timeout,
+        max_udp_payload=max(1, min(65535, args.max_message_size - 22)),
     )
     server = await serve(args.host, args.port, options, ssl_context)
     scheme = "TLS" if ssl_context else "h2c"

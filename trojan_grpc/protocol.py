@@ -18,9 +18,19 @@ class ProtocolError(ValueError):
 
 @dataclass(frozen=True)
 class TrojanRequest:
-    """The CONNECT portion of a Trojan request."""
+    """The command header of a Trojan request."""
 
     password: bytes
+    command: int
+    host: str
+    port: int
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class UdpPacket:
+    """One Trojan UDP-over-TCP packet."""
+
     host: str
     port: int
     payload: bytes
@@ -98,23 +108,13 @@ def pop_grpc_messages(buffer: bytearray, max_message_size: int) -> list[bytes]:
     return messages
 
 
-def parse_trojan_request(buffer: bytes) -> Optional[Tuple[TrojanRequest, int]]:
-    """Parse a complete Trojan CONNECT header, or return ``None`` if partial."""
+def _parse_address(buffer: bytes, cursor: int) -> Optional[Tuple[str, int, int]]:
+    """Parse a SOCKS-style address, returning ``(host, port, next_offset)``."""
 
-    # password(56) + CRLF + command + ATYP is the smallest useful prefix.
-    if len(buffer) < 60:
+    if len(buffer) < cursor + 1:
         return None
-    if len(buffer) > MAX_TROJAN_HEADER:
-        raise ProtocolError("Trojan request header exceeds 64 KiB")
-
-    password = buffer[:56]
-    if buffer[56:58] != b"\r\n":
-        raise ProtocolError("missing CRLF after Trojan password")
-    if buffer[58] != 1:
-        raise ProtocolError("this compact server supports CONNECT only")
-    atyp = buffer[59]
-    cursor = 60
-
+    atyp = buffer[cursor]
+    cursor += 1
     if atyp == 1:
         end = cursor + 4
         if len(buffer) < end + 2:
@@ -138,35 +138,99 @@ def parse_trojan_request(buffer: bytes) -> Optional[Tuple[TrojanRequest, int]]:
         if len(buffer) < end + 2:
             return None
         try:
-            host = buffer[cursor:end].decode("idna")
+            host = bytes(buffer[cursor:end]).decode("idna")
         except UnicodeError as exc:
             raise ProtocolError("invalid Trojan domain name") from exc
         cursor = end
     else:
         raise ProtocolError("unsupported Trojan address type")
-
-    port = struct.unpack(">H", buffer[cursor : cursor + 2])[0]
-    cursor += 2
-    if buffer[cursor : cursor + 2] != b"\r\n":
-        if len(buffer) < cursor + 2:
-            return None
-        raise ProtocolError("missing CRLF after Trojan address")
-    cursor += 2
-    return TrojanRequest(password, host, port, buffer[cursor:]), cursor
+    port = struct.unpack(">H", bytes(buffer[cursor : cursor + 2]))[0]
+    return host, port, cursor + 2
 
 
-def build_trojan_connect(password: str, host: str, port: int, payload: bytes = b"") -> bytes:
-    """Build a CONNECT request; useful for compatibility tests and examples."""
-
+def _encode_address(host: str, port: int, *, allow_zero_port: bool = False) -> bytes:
+    if not (0 if allow_zero_port else 1) <= port <= 65535:
+        raise ValueError("port must be in 0..65535" if allow_zero_port else "port must be in 1..65535")
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         encoded_host = host.encode("idna")
         if not 1 <= len(encoded_host) <= 255:
             raise ValueError("domain name must contain 1 to 255 encoded bytes")
-        encoded_address = b"\x03" + bytes([len(encoded_host)]) + encoded_host
-    else:
-        encoded_address = (b"\x01" if address.version == 4 else b"\x04") + address.packed
-    if not 1 <= port <= 65535:
-        raise ValueError("port must be in 1..65535")
-    return password_to_hex(password) + b"\r\n\x01" + encoded_address + struct.pack(">H", port) + b"\r\n" + payload
+        return b"\x03" + bytes([len(encoded_host)]) + encoded_host + struct.pack(">H", port)
+    return (b"\x01" if address.version == 4 else b"\x04") + address.packed + struct.pack(">H", port)
+
+
+def parse_trojan_request(buffer: bytes) -> Optional[Tuple[TrojanRequest, int]]:
+    """Parse a complete Trojan CONNECT or UDP ASSOCIATE header."""
+
+    # password(56) + CRLF + command + ATYP is the smallest useful prefix.
+    if len(buffer) < 60:
+        return None
+    if len(buffer) > MAX_TROJAN_HEADER:
+        raise ProtocolError("Trojan request header exceeds 64 KiB")
+
+    password = buffer[:56]
+    if buffer[56:58] != b"\r\n":
+        raise ProtocolError("missing CRLF after Trojan password")
+    command = buffer[58]
+    if command not in (1, 3):
+        raise ProtocolError("unsupported Trojan command")
+    address = _parse_address(buffer, 59)
+    if address is None:
+        return None
+    host, port, cursor = address
+    if buffer[cursor : cursor + 2] != b"\r\n":
+        if len(buffer) < cursor + 2:
+            return None
+        raise ProtocolError("missing CRLF after Trojan address")
+    cursor += 2
+    return TrojanRequest(password, command, host, port, buffer[cursor:]), cursor
+
+
+def build_trojan_connect(password: str, host: str, port: int, payload: bytes = b"") -> bytes:
+    """Build a CONNECT request; useful for compatibility tests and examples."""
+
+    return build_trojan_request(password, 1, host, port, payload)
+
+
+def build_trojan_request(password: str, command: int, host: str, port: int, payload: bytes = b"") -> bytes:
+    """Build either a CONNECT (1) or UDP ASSOCIATE (3) Trojan request."""
+
+    if command not in (1, 3):
+        raise ValueError("command must be CONNECT (1) or UDP ASSOCIATE (3)")
+    return password_to_hex(password) + b"\r\n" + bytes([command]) + _encode_address(
+        host, port, allow_zero_port=command == 3
+    ) + b"\r\n" + payload
+
+
+def encode_udp_packet(packet: UdpPacket) -> bytes:
+    """Encode an individual Trojan UDP-over-TCP packet."""
+
+    if len(packet.payload) > 65535:
+        raise ValueError("UDP payload exceeds the Trojan 65535-byte limit")
+    return _encode_address(packet.host, packet.port) + struct.pack(">H", len(packet.payload)) + b"\r\n" + packet.payload
+
+
+def pop_udp_packets(buffer: bytearray, max_payload_size: int = 65535) -> list[UdpPacket]:
+    """Remove all complete Trojan UDP packets currently available in *buffer*."""
+
+    packets: list[UdpPacket] = []
+    while buffer:
+        address = _parse_address(buffer, 0)
+        if address is None:
+            break
+        host, port, cursor = address
+        if len(buffer) < cursor + 4:
+            break
+        payload_size = struct.unpack(">H", bytes(buffer[cursor : cursor + 2]))[0]
+        if payload_size > max_payload_size:
+            raise ProtocolError("UDP payload exceeds configured limit")
+        if buffer[cursor + 2 : cursor + 4] != b"\r\n":
+            raise ProtocolError("missing CRLF before UDP payload")
+        frame_size = cursor + 4 + payload_size
+        if len(buffer) < frame_size:
+            break
+        packets.append(UdpPacket(host, port, bytes(buffer[cursor + 4 : frame_size])))
+        del buffer[:frame_size]
+    return packets

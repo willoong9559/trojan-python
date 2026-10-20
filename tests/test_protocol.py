@@ -2,10 +2,13 @@ import unittest
 
 from trojan_grpc.protocol import (
     ProtocolError,
+    UdpPacket,
     build_trojan_connect,
+    encode_udp_packet,
     encode_grpc_message,
     parse_trojan_request,
     pop_grpc_messages,
+    pop_udp_packets,
 )
 
 
@@ -29,3 +32,10 @@ class ProtocolTests(unittest.TestCase):
     def test_rejects_compressed_grpc_message(self):
         with self.assertRaises(ProtocolError):
             pop_grpc_messages(bytearray(b"\x01\x00\x00\x00\x00"), 1024)
+
+    def test_udp_packets_can_arrive_in_parts(self):
+        encoded = encode_udp_packet(UdpPacket("127.0.0.1", 53, b"dns-query"))
+        buffered = bytearray(encoded[:6])
+        self.assertEqual(pop_udp_packets(buffered), [])
+        buffered.extend(encoded[6:])
+        self.assertEqual(pop_udp_packets(buffered), [UdpPacket("127.0.0.1", 53, b"dns-query")])

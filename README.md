@@ -1,8 +1,8 @@
 # trojan-grpc-simple
 
-这是从本目录 `trojan-rs` 的 gRPC 实现提炼出的 Python 精简服务端。它实现与 v2ray/Xray Trojan gRPC 兼容的核心路径：HTTP/2、`Hunk { bytes data = 1; }` gRPC 消息、Trojan `CONNECT` 和 TCP 双向转发。
+这是从本目录 `trojan-rs` 的 gRPC 实现提炼出的 Python 精简服务端。它实现与 v2ray/Xray Trojan gRPC 兼容的核心路径：HTTP/2、`Hunk { bytes data = 1; }` gRPC 消息、Trojan `CONNECT`、`UDP ASSOCIATE` 和双向转发。
 
-不包含 UDP、WebSocket、ACME、回落站点、DNS 缓存及生产级限流；默认监听回环地址，适合作为协议学习、互操作验证或受控环境中的轻量服务。
+不包含 WebSocket、ACME、回落站点、DNS 缓存及生产级限流；默认监听回环地址，适合作为协议学习、互操作验证或受控环境中的轻量服务。
 
 ## 安装与运行
 
@@ -24,9 +24,9 @@ python3 -m venv .venv
 
 ## 设计范围与安全提示
 
-- 仅支持 Trojan `CONNECT` (`0x01`)；收到 UDP Associate (`0x03`) 会返回 gRPC `INVALID_ARGUMENT`。
+- 支持 Trojan `CONNECT` (`0x01`) 与 `UDP ASSOCIATE` (`0x03`)。UDP 使用 Trojan 的 UDP-over-TCP 数据帧；每个 gRPC stream 维护独立的 UDP association，默认 60 秒无流量关闭。可用 `--disable-udp` 禁用。
 - 仅支持未压缩的 gRPC Hunk 帧，并默认将单条 Hunk 限为 16 KiB。
-- 每个 HTTP/2 stream 是一个独立 TCP 隧道；服务端对密码使用 `SHA-224` 小写十六进制格式，与 `trojan-rs` 一致。
+- 每个 HTTP/2 stream 是一个独立 TCP 或 UDP 隧道；服务端对密码使用 `SHA-224` 小写十六进制格式，与 `trojan-rs` 一致。
 - 这是代理服务。请设置强密码、使用 TLS、限制网络访问，并仅在你授权的网络中部署。
 
 ## 验证
